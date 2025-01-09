@@ -255,7 +255,8 @@ ControllerManager::ControllerManager(
   chainable_loader_(
     std::make_shared<pluginlib::ClassLoader<controller_interface::ChainableControllerInterface>>(
       kControllerInterfaceNamespace, kChainableControllerInterfaceClassName)),
-  cm_node_options_(options)
+  cm_node_options_(options),
+  robot_description_(urdf)
 {
   initialize_parameters();
   resource_manager_ = std::make_unique<hardware_interface::ResourceManager>(
@@ -614,6 +615,17 @@ controller_interface::ControllerInterfaceBaseSharedPtr ControllerManager::load_c
       return nullptr;
     }
     controller_spec.info.fallback_controllers_names = fallback_controllers;
+  }
+
+  const std::string node_options_args_param = controller_name + ".node_options_args";
+  std::vector<std::string> node_options_args;
+  if (!has_parameter(node_options_args_param))
+  {
+    declare_parameter(node_options_args_param, rclcpp::ParameterType::PARAMETER_STRING_ARRAY);
+  }
+  if (get_parameter(node_options_args_param, node_options_args) && !node_options_args.empty())
+  {
+    controller_spec.info.node_options_args = node_options_args;
   }
 
   return add_controller_impl(controller_spec);
@@ -1468,6 +1480,7 @@ controller_interface::return_type ControllerManager::switch_controller(
   to = controllers;
 
   // update the claimed interface controller info
+  auto switch_result = controller_interface::return_type::OK;
   for (auto & controller : to)
   {
     if (is_controller_active(controller.c))
@@ -1488,6 +1501,32 @@ controller_interface::return_type ControllerManager::switch_controller(
     {
       controller.info.claimed_interfaces.clear();
     }
+    if (
+      std::find(activate_request_.begin(), activate_request_.end(), controller.info.name) !=
+      activate_request_.end())
+    {
+      if (!is_controller_active(controller.c))
+      {
+        RCLCPP_ERROR(
+          get_logger(), "Could not activate controller : '%s'", controller.info.name.c_str());
+        switch_result = controller_interface::return_type::ERROR;
+      }
+    }
+    /// @note The following is the case of the real controllers that are deactivated and doesn't
+    /// include the chained controllers that are deactivated and activated
+    if (
+      std::find(deactivate_request_.begin(), deactivate_request_.end(), controller.info.name) !=
+        deactivate_request_.end() &&
+      std::find(activate_request_.begin(), activate_request_.end(), controller.info.name) ==
+        activate_request_.end())
+    {
+      if (is_controller_active(controller.c))
+      {
+        RCLCPP_ERROR(
+          get_logger(), "Could not deactivate controller : '%s'", controller.info.name.c_str());
+        switch_result = controller_interface::return_type::ERROR;
+      }
+    }
   }
 
   // switch lists
@@ -1497,8 +1536,10 @@ controller_interface::return_type ControllerManager::switch_controller(
 
   clear_requests();
 
-  RCLCPP_DEBUG(get_logger(), "Successfully switched controllers");
-  return controller_interface::return_type::OK;
+  RCLCPP_DEBUG_EXPRESSION(
+    get_logger(), switch_result == controller_interface::return_type::OK,
+    "Successfully switched controllers");
+  return switch_result;
 }
 
 controller_interface::ControllerInterfaceBaseSharedPtr ControllerManager::add_controller_impl(
@@ -1730,6 +1771,7 @@ void ControllerManager::activate_controllers(
           get_logger(),
           "Resource conflict for controller '%s'. Command interface '%s' is already claimed.",
           controller_name.c_str(), command_interface.c_str());
+        command_loans.clear();
         assignment_successful = false;
         break;
       }
@@ -1744,6 +1786,7 @@ void ControllerManager::activate_controllers(
           "Caught exception of type : %s while claiming the command interfaces. Can't activate "
           "controller '%s': %s",
           typeid(e).name(), controller_name.c_str(), e.what());
+        command_loans.clear();
         assignment_successful = false;
         break;
       }
@@ -1813,6 +1856,7 @@ void ControllerManager::activate_controllers(
       RCLCPP_ERROR(
         get_logger(), "Caught exception of type : %s while activating the controller '%s': %s",
         typeid(e).name(), controller_name.c_str(), e.what());
+      controller->release_interfaces();
       continue;
     }
     catch (...)
@@ -1820,6 +1864,7 @@ void ControllerManager::activate_controllers(
       RCLCPP_ERROR(
         get_logger(), "Caught unknown exception while activating the controller '%s'",
         controller_name.c_str());
+      controller->release_interfaces();
       continue;
     }
 
@@ -2370,6 +2415,25 @@ controller_interface::return_type ControllerManager::update(
   ++update_loop_counter_;
   update_loop_counter_ %= update_rate_;
 
+  // Check for valid time
+  if (!get_clock()->started())
+  {
+    if (time == rclcpp::Time(0, 0, this->get_node_clock_interface()->get_clock()->get_clock_type()))
+    {
+      throw std::runtime_error(
+        "No clock received, and time argument is zero. Check your controller_manager node's "
+        "clock configuration (use_sim_time parameter) and if a valid clock source is "
+        "available. Also pass a proper time argument to the update method.");
+    }
+
+    // this can happen with use_sim_time=true until the /clock is received
+    rclcpp::Clock clock = rclcpp::Clock();
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), clock, 1000,
+      "No clock received, using time argument instead! Check your node's clock "
+      "configuration (use_sim_time parameter) and if a valid clock source is available");
+  }
+
   std::vector<std::string> failed_controllers_list;
   for (const auto & loaded_controller : rt_controller_list)
   {
@@ -2394,30 +2458,8 @@ controller_interface::return_type ControllerManager::update(
         run_controller_at_cm_rate ? period
                                   : rclcpp::Duration::from_seconds((1.0 / controller_update_rate));
 
-      rclcpp::Time current_time;
       bool first_update_cycle = false;
-      if (get_clock()->started())
-      {
-        current_time = get_clock()->now();
-      }
-      else if (
-        time == rclcpp::Time(0, 0, this->get_node_clock_interface()->get_clock()->get_clock_type()))
-      {
-        throw std::runtime_error(
-          "No clock received, and time argument is zero. Check your controller_manager node's "
-          "clock configuration (use_sim_time parameter) and if a valid clock source is "
-          "available. Also pass a proper time argument to the update method.");
-      }
-      else
-      {
-        // this can happen with use_sim_time=true until the /clock is received
-        rclcpp::Clock clock = rclcpp::Clock();
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), clock, 1000,
-          "No clock received, using time argument instead! Check your node's clock "
-          "configuration (use_sim_time parameter) and if a valid clock source is available");
-        current_time = time;
-      }
+      const rclcpp::Time current_time = get_clock()->started() ? get_clock()->now() : time;
       if (
         *loaded_controller.last_update_cycle_time ==
         rclcpp::Time(0, 0, this->get_node_clock_interface()->get_clock()->get_clock_type()))
@@ -2687,11 +2729,6 @@ std::pair<std::string, std::string> ControllerManager::split_command_interface(
 }
 
 unsigned int ControllerManager::get_update_rate() const { return update_rate_; }
-
-void ControllerManager::shutdown_async_controllers_and_components()
-{
-  resource_manager_->shutdown_async_components();
-}
 
 void ControllerManager::propagate_deactivation_of_chained_mode(
   const std::vector<ControllerSpec> & controllers)
@@ -3461,6 +3498,18 @@ rclcpp::NodeOptions ControllerManager::determine_controller_node_options(
     node_options_arguments.push_back(arg);
   }
 
+  // Add deprecation notice if the arguments are from the controller_manager node
+  if (
+    check_for_element(node_options_arguments, RCL_REMAP_FLAG) ||
+    check_for_element(node_options_arguments, RCL_SHORT_REMAP_FLAG))
+  {
+    RCLCPP_WARN(
+      get_logger(),
+      "The use of remapping arguments to the controller_manager node is deprecated. Please use the "
+      "'--controller-ros-args' argument of the spawner to pass remapping arguments to the "
+      "controller node.");
+  }
+
   for (const auto & parameters_file : controller.info.parameters_files)
   {
     if (!check_for_element(node_options_arguments, RCL_ROS_ARGS_FLAG))
@@ -3481,6 +3530,18 @@ rclcpp::NodeOptions ControllerManager::determine_controller_node_options(
     }
     node_options_arguments.push_back(RCL_PARAM_FLAG);
     node_options_arguments.push_back("use_sim_time:=true");
+  }
+
+  // Add options parsed through the spawner
+  if (
+    !controller.info.node_options_args.empty() &&
+    !check_for_element(controller.info.node_options_args, RCL_ROS_ARGS_FLAG))
+  {
+    node_options_arguments.push_back(RCL_ROS_ARGS_FLAG);
+  }
+  for (const auto & arg : controller.info.node_options_args)
+  {
+    node_options_arguments.push_back(arg);
   }
 
   std::string arguments;
