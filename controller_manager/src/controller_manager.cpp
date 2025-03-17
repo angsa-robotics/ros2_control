@@ -314,14 +314,14 @@ void ControllerManager::init_controller_manager()
   // Setup diagnostics
   periodicity_stats_.Reset();
   diagnostics_updater_.setHardwareID("ros2_control");
-  diagnostics_updater_.add(
-    "Controllers Activity", this, &ControllerManager::controller_activity_diagnostic_callback);
-  diagnostics_updater_.add(
-    "Hardware Components Activity", this,
-    &ControllerManager::hardware_components_diagnostic_callback);
-  diagnostics_updater_.add(
-    "Controller Manager Activity", this,
-    &ControllerManager::controller_manager_diagnostic_callback);
+  // diagnostics_updater_.add(
+  //   "Controllers Activity", this, &ControllerManager::controller_activity_diagnostic_callback);
+  // diagnostics_updater_.add(
+  //   "Hardware Components Activity", this,
+  //   &ControllerManager::hardware_components_diagnostic_callback);
+  // diagnostics_updater_.add(
+  //   "Controller Manager Activity", this,
+  //   &ControllerManager::controller_manager_diagnostic_callback);
 }
 
 void ControllerManager::initialize_parameters()
